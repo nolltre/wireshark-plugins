@@ -6,15 +6,16 @@
 -- HTMSG Binary format
 -- https://docs.tvheadend.org/documentation/development/htsp/htsmsg-binary-format
 --
--- Name  ID  Description
--- Map   1    Sub message of type map
--- S64   2    Signed 64bit integer
--- Str   3    UTF-8 encoded string
--- Bin   4    Binary blob
--- List  5    Sub message of type list
--- Dbl   6    Double precision floating point
--- Bool  7    Boolean
--- UUID  8    64 bit UUID in binary format
+--| Name | ID  | Description                     |
+--| ---- | --- | ------------------------------- |
+--| Map  | 1   | Sub message of type map         |
+--| S64  | 2   | Signed 64bit integer            |
+--| Str  | 3   | UTF-8 encoded string            |
+--| Bin  | 4   | Binary blob                     |
+--| List | 5   | Sub message of type list        |
+--| Dbl  | 6   | Double precision floating point |
+--| Bool | 7   | Boolean                         |
+--| UUID | 8   | 64 bit UUID in binary format    |
 
 -- Root body
 -- Length    4 byte integer    Total length of message (not including this length field itself)
@@ -42,13 +43,12 @@ local htsp_field_types = {
 
 -- Fields
 local htmsgfield_length = ProtoField.uint32("htsp.length", "length", base.DEC, nil, nil, "Length of the payload")
-local htmsgfield_name = ProtoField.string("htmsg.name", "name", base.UNICODE, "Name of the field")
-local htmsgfield_data = ProtoField.bytes("htmsg.data", "data", base.SPACE, "Binary blob")
+local htmsgfield_s64 = ProtoField.int64("htmsg.s64", "data", nil, nil, "Signed 64bit integer")
 local htmsgfield_str = ProtoField.string("htmsg.string", "string", base.UNICODE, "UTF-8 encoded string")
-local htmsgfield_s64 = ProtoField.int64("htmsg.int64data", "data", nil, nil, "Signed 64bit integer")
-local htmsgfield_guid = ProtoField.guid("htmsg.guid", "uuid", "64 bit UUID in binary format")
+local htmsgfield_data = ProtoField.bytes("htmsg.data", "data", base.SPACE, "Binary blob")
 local htmsgfield_dbl = ProtoField.double("htmsg.dbl", "dbl", "Double precision floating point")
 local htmsgfield_bool = ProtoField.bool("htmsg.bool", "bool", nil, nil, "Boolean")
+local htmsgfield_guid = ProtoField.guid("htmsg.uuid", "uuid", "64 bit UUID in binary format")
 
 local type_to_field = {
 	[2] = htmsgfield_s64,
@@ -62,7 +62,6 @@ local type_to_field = {
 -- Register the fields
 htsp_protocol.fields = {
 	htmsgfield_length,
-	htmsgfield_name,
 	htmsgfield_data,
 	htmsgfield_str,
 	htmsgfield_s64,
@@ -86,23 +85,25 @@ add_htmsg_field = function(subtree, buffer)
 
 		-- Add a subtree
 		local htmsgfield = subtree:add(htsp_protocol, buffer(), htsp_field_types[msgtype])
-		items_added = items_added + 1
 		if namelength > 0 then
 			local name = buffer(offset, namelength)
-			-- Prepend the name
-			htmsgfield:prepend_text(name:string() .. " (")
-			htmsgfield:append_text(")")
+			htmsgfield:set_text(name:string())
 		end
 
 		-- Call this function again, on the data in the buffer that is associated with this field
 		local bytes_remaining = datalength
 		local start_offset = offset + namelength
+		-- Add a generated value with the type of this field
+		local item = htmsgfield:add(htsp_field_types[msgtype])
+		item:set_generated(true)
 		while bytes_remaining > 0 do
-			local bytes_read, itms_added = add_htmsg_field(htmsgfield, buffer(start_offset, bytes_remaining))
+			local bytes_read, fields_added = add_htmsg_field(htmsgfield, buffer(start_offset, bytes_remaining))
 			bytes_remaining = bytes_remaining - bytes_read
 			start_offset = start_offset + bytes_read
-			items_added = items_added + itms_added
+			items_added = items_added + fields_added
 		end
+		item:append_text(", Items: " .. items_added)
+		items_added = items_added + 1
 	-- msgtype 2-8 bar 5
 	elseif msgtype >= 2 and msgtype <= 8 then
 		if datalength > 0 then
@@ -157,10 +158,10 @@ function htsp_protocol.dissector(buffer, pinfo, tree)
 	local bytes_remaining = buffer:len() - htsp_msg_len_bytes
 	local offset = htsp_msg_len_bytes
 	while bytes_remaining > 0 do
-		local bytes_read, itms_added = add_htmsg_field(subtree, buffer(offset))
+		local bytes_read, fields_added = add_htmsg_field(subtree, buffer(offset))
 		bytes_remaining = bytes_remaining - bytes_read
 		offset = offset + bytes_read
-		items_added = items_added + itms_added
+		items_added = items_added + fields_added
 	end
 
 	subtree:append_text(", Items: " .. items_added)
