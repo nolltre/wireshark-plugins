@@ -1,4 +1,10 @@
+-- Dissector for the HTSP protocol
+-- Version 0.0.1
+-- Author Daniel Karmark
+-- Repository https://github.com/nolltre/wireshark-plugins
+
 -- HTMSG Binary format
+-- https://docs.tvheadend.org/documentation/development/htsp/htsmsg-binary-format
 --
 -- Name  ID  Description
 -- Map   1    Sub message of type map
@@ -10,8 +16,6 @@
 -- Bool  7    Boolean
 -- UUID  8    64 bit UUID in binary format
 
-htsp_protocol = Proto("HTSP", "HTSP Protocol")
-
 -- Root body
 -- Length    4 byte integer    Total length of message (not including this length field itself)
 -- Body      HTSMSG-Field * N  Fields in the root body
@@ -22,114 +26,144 @@ htsp_protocol = Proto("HTSP", "HTSP Protocol")
 -- Datalength  4 byte integer  Length of field data
 -- Name        N bytes         Field name, length as specified by Namelength
 -- Data        N bytes         Field payload, for details see below
-local message_length = ProtoField.int32("htsp.length", "length", base.DEC)
-TYPES = { "Map", "S64", "Str", "Bin", "List", "Dbl", "Bool", "UUID" }
-local htmsgfield_type = ProtoField.int8("htmsg.type", "type", base.DEC, TYPES)
--- { "Map", "S64", "Str", "Bin", "List", "Dbl", "Bool", "UUID" }
-local htmsgfield_namelength = ProtoField.int8("htmsg.namelength", "namelength", base.DEC)
-local htmsgfield_datalength = ProtoField.int32("htmsg.datalength", "datalength", base.DEC)
-local htmsgfield_name = ProtoField.string("htmsg.name", "name", base.UNICODE)
-local htmsgfield_data = ProtoField.string("htmsg.data", "data")
-local htmsgfield_int64data = ProtoField.uint64("htmsg.int64data", "data")
-local htmsgfield_guid = ProtoField.guid("htmsg.guid", "uuid")
-local htmsgfield_dbl = ProtoField.double("htmsg.dbl", "dbl")
-local htmsgfield_bool = ProtoField.bool("htmsg.bool", "bool")
 
-htsp_protocol.fields = {
-        message_length,
-        htmsgfield_type,
-        htmsgfield_namelength,
-        htmsgfield_datalength,
-        htmsgfield_name,
-        htmsgfield_data,
-        htmsgfield_int64data,
-        htmsgfield_guid,
-        htmsgfield_dbl,
-        htmsgfield_bool,
+local htsp_protocol = Proto("HTSP", "htsp protocol")
+
+local htsp_field_types = {
+	[1] = "Map",
+	[2] = "S64",
+	[3] = "Str",
+	[4] = "Bin",
+	[5] = "List",
+	[6] = "Dbl",
+	[7] = "Bool",
+	[8] = "UUID",
 }
 
-function htsp_protocol.dissector(buffer, pinfo, tree)
-        if buffer:len() == 0 then
-                return
-        end
+-- Fields
+local htmsgfield_length = ProtoField.uint32("htsp.length", "length", base.DEC, nil, nil, "Length of the payload")
+local htmsgfield_name = ProtoField.string("htmsg.name", "name", base.UNICODE, "Name of the field")
+local htmsgfield_data = ProtoField.bytes("htmsg.data", "data", base.SPACE, "Binary blob")
+local htmsgfield_str = ProtoField.string("htmsg.string", "string", base.UNICODE, "UTF-8 encoded string")
+local htmsgfield_s64 = ProtoField.int64("htmsg.int64data", "data", nil, nil, "Signed 64bit integer")
+local htmsgfield_guid = ProtoField.guid("htmsg.guid", "uuid", "64 bit UUID in binary format")
+local htmsgfield_dbl = ProtoField.double("htmsg.dbl", "dbl", "Double precision floating point")
+local htmsgfield_bool = ProtoField.bool("htmsg.bool", "bool", nil, nil, "Boolean")
 
-        pinfo.cols.protocol = htsp_protocol.name
+local type_to_field = {
+	[2] = htmsgfield_s64,
+	[3] = htmsgfield_str,
+	[4] = htmsgfield_data,
+	[6] = htmsgfield_dbl,
+	[7] = htmsgfield_bool,
+	[8] = htmsgfield_guid,
+}
 
-        local subtree = tree:add(htsp_protocol, buffer(), "HTSP Protocol Data")
+-- Register the fields
+htsp_protocol.fields = {
+	htmsgfield_length,
+	htmsgfield_name,
+	htmsgfield_data,
+	htmsgfield_str,
+	htmsgfield_s64,
+	htmsgfield_guid,
+	htmsgfield_dbl,
+	htmsgfield_bool,
+}
 
-        local htsp_msg_len = buffer(0, 4)
-        subtree:add(message_length, htsp_msg_len)
+local add_htmsg_field
+add_htmsg_field = function(subtree, buffer)
+	local msgtype = buffer(0, 1):uint()
+	local namelength = buffer(1, 1):uint()
+	local datalength = buffer(2, 4):uint()
 
-        local missing_data = htsp_msg_len:uint() - buffer:len()
-        if missing_data > 0 then
-                pinfo.desegment_len = missing_data + 4
-                return
-        end
+	local offset = 6 -- size of msgtype, namelength and datalength
+	local total_bytes = offset + namelength + datalength
+	local items_added = 0
 
-        local bytes_remaining = buffer:len() - 4
-        local start_byte = 4
-        while bytes_remaining > 0 do
-                local bytes_read = add_htmsg_field(subtree, buffer(start_byte, len))
-                bytes_remaining = bytes_remaining - bytes_read
-                start_byte = start_byte + bytes_read
-        end
+	if msgtype == 1 or msgtype == 5 then -- Map or List
+		-- NOTE: This is handled in the same way as with the root message so the function runs recursively
+
+		-- Add a subtree
+		local htmsgfield = subtree:add(htsp_protocol, buffer(), htsp_field_types[msgtype])
+		items_added = items_added + 1
+		if namelength > 0 then
+			local name = buffer(offset, namelength)
+			-- Prepend the name
+			htmsgfield:prepend_text(name:string() .. " (")
+			htmsgfield:append_text(")")
+		end
+
+		-- Call this function again, on the data in the buffer that is associated with this field
+		local bytes_remaining = datalength
+		local start_offset = offset + namelength
+		while bytes_remaining > 0 do
+			local bytes_read, itms_added = add_htmsg_field(htmsgfield, buffer(start_offset, bytes_remaining))
+			bytes_remaining = bytes_remaining - bytes_read
+			start_offset = start_offset + bytes_read
+			items_added = items_added + itms_added
+		end
+	-- msgtype 2-8 bar 5
+	elseif msgtype >= 2 and msgtype <= 8 then
+		if datalength > 0 then
+			local name = buffer(offset, namelength)
+			local value = buffer(offset + namelength, datalength)
+			local item = subtree:add(type_to_field[msgtype], value)
+			items_added = items_added + 1
+			-- Split on the first colon, replace with the name of this item if applicable
+			local string_val = item.text:match("[^:]+: (.*)")
+
+			-- NOTE: This is a workaround for when an item is marked as S64, but in
+			-- reality is less than that. We assume to NOT have the value signed
+			if htsp_field_types[msgtype] == "S64" and datalength ~= 8 then
+				string_val = value:uint64()
+			end
+
+			-- Concat name if we have it
+			if namelength > 0 then
+				item:set_text(name:string() .. ": " .. string_val)
+			else
+				item:set_text(string_val)
+			end
+		end
+	end
+
+	return total_bytes, items_added
 end
 
-function add_htmsg_field(subtree, buffer)
-        local msgtype = buffer(0, 1):uint()
-        local namelength = buffer(1, 1):uint()
-        local datalength = buffer(2, 4):uint()
-        local htmsgfield = subtree:add(htsp_protocol, buffer(), "Field (" .. TYPES[msgtype] .. ")")
-        htmsgfield:add(htmsgfield_type, buffer(0, 1))
-        -- htmsgfield:add(htmsgfield_namelength, buffer(1, 1))
-        -- htmsgfield:add(htmsgfield_datalength, buffer(2, 4))
+function htsp_protocol.dissector(buffer, pinfo, tree)
+	if buffer:len() == 0 then
+		return
+	end
 
-        local offset = 6 -- size of msgtype, namelength and datalength
-        -- type + namelength (1 + len) + datalength (4 + len)
-        local total_bytes = offset + namelength + datalength
-        if namelength > 0 then
-                local name = buffer(offset, namelength)
-                htmsgfield:add(htmsgfield_name, name)
-                htmsgfield:append_text(" - " .. name:string())
-        end
-        if msgtype == 1 or msgtype == 5 then -- Map or List
-                -- This is the same as the root message, so call this function again
-                local bytes_remaining = datalength
-                local start_byte = offset + namelength
-                while bytes_remaining > 0 do
-                        local bytes_read = add_htmsg_field(htmsgfield, buffer(start_byte, bytes_remaining))
-                        bytes_remaining = bytes_remaining - bytes_read
-                        start_byte = start_byte + bytes_read
-                end
-        elseif msgtype == 2 then -- S64
-                if datalength > 0 then
-                        htmsgfield:add(htmsgfield_int64data, buffer(offset + namelength, datalength))
-                end
-        elseif msgtype == 3 then -- Str
-                if datalength > 0 then
-                        htmsgfield:add(htmsgfield_data, buffer(offset + namelength, datalength))
-                end
-        elseif msgtype == 6 then -- Dbl
-                if datalength > 0 then
-                        htmsgfield:add(htmsgfield_dbl, buffer(offset + namelength, datalength))
-                end
-        elseif msgtype == 7 then -- Bool
-                if datalength > 0 then
-                        htmsgfield:add(htmsgfield_bool, buffer(offset + namelength, datalength))
-                end
-        elseif msgtype == 8 then -- UUID
-                if datalength > 0 then
-                        htmsgfield:add(htmsgfield_guid, buffer(offset + namelength, datalength))
-                end
-        else
-                local hexstring = ""
-                for i = 0, datalength - 1 do
-                        hexstring = hexstring .. string.format("%02x", buffer(offset + namelength + i, 1):uint())
-                end
-                htmsgfield:add(htmsgfield_data, hexstring)
-        end
+	pinfo.cols.protocol = htsp_protocol.name
 
-        return total_bytes
+	local subtree = tree:add(htsp_protocol, buffer(), "HTSP Protocol Data")
+
+	local htsp_msg_len_bytes = 4
+	local htsp_msg_len = buffer(0, htsp_msg_len_bytes)
+	subtree:add(htmsgfield_length, htsp_msg_len)
+	subtree:append_text(", Len: " .. htsp_msg_len:uint())
+	local items_added = 1
+
+	-- Take care of reassembling the HTSP data if split over multiple TCP packets
+	-- We need to add the 4 bytes that make up the total message length. It is not included.
+	local missing_data = (htsp_msg_len_bytes + htsp_msg_len:uint()) - buffer:len()
+	if missing_data > 0 then
+		pinfo.desegment_len = missing_data
+		return
+	end
+
+	local bytes_remaining = buffer:len() - htsp_msg_len_bytes
+	local offset = htsp_msg_len_bytes
+	while bytes_remaining > 0 do
+		local bytes_read, itms_added = add_htmsg_field(subtree, buffer(offset))
+		bytes_remaining = bytes_remaining - bytes_read
+		offset = offset + bytes_read
+		items_added = items_added + itms_added
+	end
+
+	subtree:append_text(", Items: " .. items_added)
 end
 
 local tcp_port = DissectorTable.get("tcp.port")
