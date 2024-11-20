@@ -28,7 +28,7 @@
 -- Name        N bytes         Field name, length as specified by Namelength
 -- Data        N bytes         Field payload, for details see below
 
-local htsp_protocol = Proto("HTSP", "htsp protocol")
+local proto_htsp = Proto("HTSP", "htsp protocol")
 
 local htsp_field_types = {
 	[1] = "Map",
@@ -60,7 +60,7 @@ local type_to_field = {
 }
 
 -- Register the fields
-htsp_protocol.fields = {
+proto_htsp.fields = {
 	htmsgfield_length,
 	htmsgfield_data,
 	htmsgfield_str,
@@ -71,10 +71,10 @@ htsp_protocol.fields = {
 }
 
 local add_htmsg_field
-add_htmsg_field = function(subtree, buffer)
-	local msgtype = buffer(0, 1):uint()
-	local namelength = buffer(1, 1):uint()
-	local datalength = buffer(2, 4):uint()
+add_htmsg_field = function(subtree, tvb)
+	local msgtype = tvb(0, 1):uint()
+	local namelength = tvb(1, 1):uint()
+	local datalength = tvb(2, 4):uint()
 
 	local offset = 6 -- size of msgtype, namelength and datalength
 	local total_bytes = offset + namelength + datalength
@@ -84,9 +84,9 @@ add_htmsg_field = function(subtree, buffer)
 		-- NOTE: This is handled in the same way as with the root message so the function runs recursively
 
 		-- Add a subtree
-		local htmsgfield = subtree:add(htsp_protocol, buffer(), htsp_field_types[msgtype])
+		local htmsgfield = subtree:add(proto_htsp, tvb(), htsp_field_types[msgtype])
 		if namelength > 0 then
-			local name = buffer(offset, namelength)
+			local name = tvb(offset, namelength)
 			htmsgfield:set_text(name:string())
 		end
 
@@ -97,7 +97,7 @@ add_htmsg_field = function(subtree, buffer)
 		local item = htmsgfield:add(htsp_field_types[msgtype])
 		item:set_generated(true)
 		while bytes_remaining > 0 do
-			local bytes_read, fields_added = add_htmsg_field(htmsgfield, buffer(start_offset, bytes_remaining))
+			local bytes_read, fields_added = add_htmsg_field(htmsgfield, tvb(start_offset, bytes_remaining))
 			bytes_remaining = bytes_remaining - bytes_read
 			start_offset = start_offset + bytes_read
 			items_added = items_added + fields_added
@@ -107,8 +107,8 @@ add_htmsg_field = function(subtree, buffer)
 	-- msgtype 2-8 bar 5
 	elseif msgtype >= 2 and msgtype <= 8 then
 		if datalength > 0 then
-			local name = buffer(offset, namelength)
-			local value = buffer(offset + namelength, datalength)
+			local name = tvb(offset, namelength)
+			local value = tvb(offset + namelength, datalength)
 			local item = subtree:add(type_to_field[msgtype], value)
 			items_added = items_added + 1
 			-- Split on the first colon, replace with the name of this item if applicable
@@ -123,8 +123,16 @@ add_htmsg_field = function(subtree, buffer)
 			-- Concat name if we have it
 			if namelength > 0 then
 				item:set_text(name:string() .. ": " .. string_val)
+				-- Add the method to the info column
+				if name:string() == "method" then
+					subtree:append_text(", Method: " .. string_val)
+				end
 			else
-				item:set_text(string_val)
+				-- TODO: Is this the correct way of working around this "userdata" error:
+				-- bad argument #1 to 'set_text' (string expected, got userdata)
+				--
+				-- The above seem to happen when the value is a number
+				item:set_text("" .. string_val)
 			end
 		end
 	end
@@ -132,33 +140,33 @@ add_htmsg_field = function(subtree, buffer)
 	return total_bytes, items_added
 end
 
-function htsp_protocol.dissector(buffer, pinfo, tree)
-	if buffer:len() == 0 then
+function proto_htsp.dissector(tvb, pinfo, tree)
+	if tvb:len() == 0 then
 		return
 	end
 
-	pinfo.cols.protocol = htsp_protocol.name
+	pinfo.cols.protocol = proto_htsp.name
 
-	local subtree = tree:add(htsp_protocol, buffer(), "HTSP Protocol Data")
+	local subtree = tree:add(proto_htsp, tvb(), "HTSP Protocol Data")
 
 	local htsp_msg_len_bytes = 4
-	local htsp_msg_len = buffer(0, htsp_msg_len_bytes)
+	local htsp_msg_len = tvb(0, htsp_msg_len_bytes)
 	subtree:add(htmsgfield_length, htsp_msg_len)
 	subtree:append_text(", Len: " .. htsp_msg_len:uint())
 	local items_added = 1
 
 	-- Take care of reassembling the HTSP data if split over multiple TCP packets
 	-- We need to add the 4 bytes that make up the total message length. It is not included.
-	local missing_data = (htsp_msg_len_bytes + htsp_msg_len:uint()) - buffer:len()
+	local missing_data = (htsp_msg_len_bytes + htsp_msg_len:uint()) - tvb:len()
 	if missing_data > 0 then
 		pinfo.desegment_len = missing_data
 		return
 	end
 
-	local bytes_remaining = buffer:len() - htsp_msg_len_bytes
+	local bytes_remaining = tvb:len() - htsp_msg_len_bytes
 	local offset = htsp_msg_len_bytes
 	while bytes_remaining > 0 do
-		local bytes_read, fields_added = add_htmsg_field(subtree, buffer(offset))
+		local bytes_read, fields_added = add_htmsg_field(subtree, tvb(offset))
 		bytes_remaining = bytes_remaining - bytes_read
 		offset = offset + bytes_read
 		items_added = items_added + fields_added
@@ -168,4 +176,4 @@ function htsp_protocol.dissector(buffer, pinfo, tree)
 end
 
 local tcp_port = DissectorTable.get("tcp.port")
-tcp_port:add(9982, htsp_protocol)
+tcp_port:set(9982, proto_htsp)
