@@ -36,7 +36,7 @@ local proto_htsp = Proto("HTSP", "htsp protocol")
 local get_tcp_stream = Field.new("frame.number")
 
 -- declare the functions used later (like C forward declarations)
-local dissect_htsp, checkHtspLength, dissect_body, dissect_s64
+local dissect_htsp, checkHtspLength, dissect_body, dissect_s64, proto_htsp_fields
 
 local htsp_field_types = {
 	Map = 1,
@@ -49,55 +49,7 @@ local htsp_field_types = {
 	UUID = 8,
 }
 
-dissect_s64 = function(s64_buf)
-	-- print(tostring(get_tcp_stream()) .. ": datatype_buf:len(): " .. ((s64_buf ~= nil) and s64_buf:len() or "nil"))
-	if s64_buf == nil then
-		return Int64(0)
-	end
-	-- A S64 may be shorter than 8 bytes, use the high/low Int64 way of creating a proper Int64
-	local s64_len = s64_buf:len()
-	-- Extract low bytes, if len > 4 start from 4, else start from pos 0
-	local low = s64_buf:range((s64_len > 4) and s64_buf(4, s64_len) or 0):uint()
-	-- ... and high bytes
-	local high = (s64_len > 4) and s64_buf(0, 4):uint() or 0
-	return Int64.new(low, high)
-end
-
-dissect_str = function(str_buf)
-	if str_buf == nil then
-		print(tostring(get_tcp_stream()) .. ": str_buf:len(): " .. ((str_buf ~= nil) and str_buf:len() or "nil"))
-		return ""
-	else
-		return str_buf:string()
-	end
-end
-
-dissect_list = function(list_buf, tree)
-	-- Dissect as any other body
-	print(tostring(get_tcp_stream()) .. ": list_buf:len(): " .. ((list_buf ~= nil) and list_buf:len() or "nil"))
-	dissect_body(tree, list_buf)
-end
-
-dissect_map = function(map_buf, tree)
-	-- Dissect as any other body
-	print(tostring(get_tcp_stream()) .. ": map_buf:len(): " .. ((map_buf ~= nil) and map_buf:len() or "nil"))
-	-- return map_buf
-	dissect_body(tree, map_buf)
-end
---
---- Dissectors based on type value
----
-local dissect_types = {
-	Map = dissect_map,
-	S64 = dissect_s64,
-	Str = dissect_str,
-	Bin = dissect_bin,
-	List = dissect_list,
-	Dbl = dissect_dbl,
-	Bool = dissect_bool,
-	UUID = dissect_uuid,
-}
-----------------------------------------
+-- (from https://github.com/biggnou/pcap/blob/master/fpm.lua)
 -- a function to convert tables of enumerated types to value-string tables
 -- i.e., from { "name" = number } to { number = "name" }
 local function makeValString(enumTable)
@@ -111,12 +63,20 @@ end
 local msgtype_valstr = makeValString(htsp_field_types)
 
 -- Header fields
+-- Root
 local proto_htsp_fields = {
-	msg_len = ProtoField.uint32("htsp.length", "length", base.DEC, nil, nil, "Length of the payload"),
-	body = ProtoField.bytes("htsp.body", "body", base.SPACE, "HTMSG body"),
+	msg_len = ProtoField.uint32(
+		"htsp.length",
+		"Length",
+		base.DEC,
+		nil,
+		nil,
+		"Total length of message (not including this length field itself)"
+	),
+	body = ProtoField.bytes("htsp.body", "Body", base.SPACE, "Fields in the root body"),
 }
 
--- HTSMSG fields
+-- HTSMSG field
 local htsmsg_fields = {
 	type = ProtoField.uint8("htsmsg.type", "Type", base.DEC, msgtype_valstr, nil, "Type of field"),
 	namelength = ProtoField.uint8(
@@ -155,6 +115,64 @@ for k, v in pairs(data_types) do
 end
 proto_htsp.fields = proto_htsp_fields
 
+dissect_s64 = function(s64_buf)
+	-- print(tostring(get_tcp_stream()) .. ": datatype_buf:len(): " .. ((s64_buf ~= nil) and s64_buf:len() or "nil"))
+	if s64_buf == nil then
+		return Int64(0)
+	end
+
+	local s64_len = s64_buf:len()
+	if s64_len == 8 then
+		return s64_buf:int64()
+	end
+
+	-- A S64 may be shorter than 8 bytes, create a new byte array with a 0 at the start to not get negative values
+	local new_int = ByteArray.new(string.rep("\0", 8 - s64_len), true)
+	new_int:append(s64_buf:bytes())
+	return new_int:int64()
+end
+
+dissect_str = function(str_buf)
+	if str_buf == nil then
+		return ""
+	else
+		return str_buf:string()
+	end
+end
+
+dissect_map_or_list = function(field_type, buf, tree)
+	local sub_tree
+	if buf then
+		sub_tree = tree:add(proto_htsp_fields.type, buf, field_type)
+	else
+		sub_tree = tree:add(proto_htsp_fields.type, field_type)
+	end
+	local str_datatype = msgtype_valstr[field_type]
+	sub_tree:set_text(str_datatype)
+	dissect_body(sub_tree, buf)
+	return sub_tree
+end
+
+dissect_list = function(list_buf, tree)
+	return nil, dissect_map_or_list(htsp_field_types.List, list_buf, tree)
+end
+
+dissect_map = function(map_buf, tree)
+	return nil, dissect_map_or_list(htsp_field_types.Map, map_buf, tree)
+end
+--
+--- Dissectors based on type value
+---
+local dissect_types = {
+	Map = dissect_map,
+	S64 = dissect_s64,
+	Str = dissect_str,
+	Bin = dissect_bin,
+	List = dissect_list,
+	Dbl = dissect_dbl,
+	Bool = dissect_bool,
+	UUID = dissect_uuid,
+}
 -- The HTSMG header size is 6 bytes
 local HTSMSG_LEN = 4
 local HTSMSG_HDR_LEN = 6
@@ -225,7 +243,7 @@ dissect_htsp = function(tvbuf, pktinfo, root, offset)
 	-- Add the body
 	local body_tvbr = htsp_buf:range(HTSMSG_LEN)
 	local body = tree:add(proto_htsp_fields.body, body_tvbr)
-	body:prepend_text("Len: " .. body_tvbr:len() .. " : ")
+	body:set_text("Root body, Len: " .. body_tvbr:len())
 	dissect_body(body, body_tvbr)
 	return length_val
 end
@@ -237,6 +255,12 @@ checkHtspLength = function(tvbuf, offset)
 	if msglen < HTSMSG_LEN then
 		-- Not enough bytes to read the length, request another segment
 		return -DESEGMENT_ONE_MORE_SEGMENT
+	end
+
+	-- Check if capture was only capturing a partial packet
+	if msglen ~= tvbuf:reported_length_remaining(offset) then
+		-- Packets are sliced/cut-off, don't desegment/reassemble
+		return 0
 	end
 
 	-- We have enough bytes to determine the length of the message
@@ -251,6 +275,10 @@ checkHtspLength = function(tvbuf, offset)
 end
 
 dissect_body = function(tree, tvbuf)
+	-- Handle nil value
+	if not tvbuf then
+		return 0
+	end
 	-- Dissect the body
 	local tvb_length = tvbuf:len()
 
@@ -278,29 +306,25 @@ dissect_body = function(tree, tvbuf)
 		-- 		.. " offset "
 		-- 		.. offset
 		-- )
-		local new_item = tree:add(
-			proto_htsp_fields.type,
-			tvbuf:range(offset, HTSMSG_HDR_LEN + name_length + data_length),
-			datatype_val
-		)
-
-		offset = offset + HTSMSG_HDR_LEN
-
-		local type_text = new_item.text
-
-		local name, data_string_val
-		-- Add name?
-		if name_length > 0 then
-			local name_tvbr = tvbuf:range(offset, name_length)
-			new_item:add(proto_htsp_fields.name, name_tvbr)
-			-- new_item:set_text(name_tvbr:string())
-			name = name_tvbr:string()
-			offset = offset + name_length
-		end
-
 		local str_datatype = msgtype_valstr[datatype_val]
 		local field_type = data_types[str_datatype]
 
+		-- local new_item = tree:add(
+		-- 	proto_htsp_fields.type,
+		-- 	tvbuf:range(offset, HTSMSG_HDR_LEN + name_length + data_length),
+		-- 	datatype_val
+		-- )
+
+		offset = offset + HTSMSG_HDR_LEN
+
+		local name
+		-- Add name?
+		if name_length > 0 then
+			local name_tvbr = tvbuf:range(offset, name_length)
+			name = name_tvbr:string()
+		end
+
+		offset = offset + name_length
 		--[[
     Add data, 
      TODO: Handle default values if datalength is 0
@@ -318,26 +342,39 @@ dissect_body = function(tree, tvbuf)
 			-- )
 			-- Need to understand if we have any data or if we set default values
 			local data_buf = (data_length > 0) and tvbuf:range(offset, data_length) or nil
+			local sub_tree
 			if subdissector ~= nil then
 				-- Send the data buffer as nil if the data_length is 0, this avoids errors as we can check for nil
-				local data_value = subdissector(data_buf, new_item)
-				data_string_val = data_value and tostring(data_value)
-				-- Some sub dissectors do not return any data (e.g. for List and Map)
-				if data_value and data_buf then
-					data_item = new_item:add(field_type, data_buf, data_value)
+				-- Some dissectors create a sub_tree that we can add to the tree
+				local data_value
+				data_value, sub_tree = subdissector(data_buf, tree)
+				if sub_tree then
+					data_item = sub_tree
+				elseif data_value and data_buf then
+					data_item = tree:add(field_type, data_buf, data_value)
 				elseif data_value then
-					data_item = new_item:add(field_type, data_value)
+					data_item = tree:add(field_type, data_value)
 				else
-					data_item = new_item:add(field_type, data_buf)
+					data_item = tree:add(field_type, data_buf)
 				end
 			else
-				data_item = new_item:add(field_type, data_buf)
+				data_item = tree:add(field_type, data_buf)
+			end
+			-- Split on the first colon, replace with the name of this item if applicable
+			local string_val = data_item.text:match("[^:]+: (.*)") or ""
+
+			-- Add name?
+			if name then
+				string_val = (string_val:len() > 0) and ": " .. string_val or string_val
+				data_item:set_text(name .. string_val)
+			elseif not sub_tree then
+				data_item:set_text(string_val)
 			end
 
 			-- Some sub dissectors do not return any data
-			if data_item then
-				new_item:append_text(", " .. data_item.text)
-			end
+			-- if data_item then
+			-- 	tree:append_text(", " .. data_item.text)
+			-- end
 			offset = offset + data_length
 		else
 			print(
@@ -352,12 +389,12 @@ dissect_body = function(tree, tvbuf)
 		end
 
 		-- Format type text
-		if name then
-			-- Split on the first colon, replace with the name of this item if applicable
-			-- local string_val = item.text:match("[^:]+: (.*)")
-			data_string_val = data_string_val and (": " .. data_string_val) or ""
-			new_item:set_text(name .. data_string_val .. " [" .. type_text .. "]")
-		end
+		-- if name then
+		-- Split on the first colon, replace with the name of this item if applicable
+		-- local string_val = item.text:match("[^:]+: (.*)")
+		-- 	data_string_val = data_string_val and (": " .. data_string_val) or ""
+		-- 	tree:set_text(name .. data_string_val .. " [" .. type_text .. "]")
+		-- end
 
 		-- We add the length of both name and data + the header length
 		bytes_consumed = offset
