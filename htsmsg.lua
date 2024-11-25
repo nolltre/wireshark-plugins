@@ -1,8 +1,5 @@
 --[[ 
 Dissector for the HTSP protocol
-Version 0.0.1
-Author Daniel Karmark
-Repository https://github.com/nolltre/wireshark-plugins
 
 HTMSG Binary format
 https://docs.tvheadend.org/documentation/development/htsp/htsmsg-binary-format
@@ -30,9 +27,18 @@ Name        N bytes         Field name, length as specified by Namelength
 Data        N bytes         Field payload, for details see below 
 
 ]]
---
 
-local proto_htsp = Proto("HTSP", "htsp protocol")
+-- Visible in Help -> About Wireshark -> Plugins tab
+local info = {
+	version = "0.0.2",
+	description = "Dissector for the HTSP protocol",
+	author = "Daniel Karmark",
+	repository = "https://github.com/nolltre/wireshark-plugins",
+}
+
+set_plugin_info(info)
+
+local proto_htsp = Proto("HTSP", "HTSP Protocol")
 local get_tcp_stream = Field.new("frame.number")
 
 -- declare the functions used later (like C forward declarations)
@@ -77,6 +83,7 @@ local proto_htsp_fields = {
 }
 
 -- HTSMSG field
+-- FIXME: Remove what we don't use
 local htsmsg_fields = {
 	type = ProtoField.uint8("htsmsg.type", "Type", base.DEC, msgtype_valstr, nil, "Type of field"),
 	namelength = ProtoField.uint8(
@@ -89,7 +96,6 @@ local htsmsg_fields = {
 	),
 	datalength = ProtoField.uint32("htsmsg.datalength", "Datalength", base.DEC, nil, nil, "Length of field data"),
 	name = ProtoField.string("htsmsg.name", "name", base.UNICODE, "Field name, length as specified by Namelength"),
-	data = ProtoField.bytes("htsmsg.data", "data", base.SPACE, "Field payload"),
 }
 
 -- Data types
@@ -154,6 +160,7 @@ dissect_map_or_list = function(field_type, buf, tree)
 end
 
 dissect_list = function(list_buf, tree)
+	-- TODO: A list is not allowed to have items with names, add expert info for the event that there's a name attached
 	return nil, dissect_map_or_list(htsp_field_types.List, list_buf, tree)
 end
 
@@ -183,11 +190,18 @@ function proto_htsp.dissector(tvbuf, pktinfo, root)
 
 	local bytes_consumed = 0
 
+	-- Create one subtree that we use to put all the dissected HTSMSG fields under
+	local tree = root:add(proto_htsp, tvbuf, proto_htsp.description)
+
+	-- Keep track of the message number
+	local htsmsg_num = 1
+
 	-- Do this in a while loop since multiple HTSP messages can appear in the same TCP segment
 	while bytes_consumed < pktlen do
-		local result = dissect_htsp(tvbuf, pktinfo, root, bytes_consumed)
+		local result = dissect_htsp(tvbuf, pktinfo, tree, bytes_consumed, htsmsg_num)
 		if result > 0 then -- Success
 			bytes_consumed = bytes_consumed + result
+			htsmsg_num = htsmsg_num + 1
 		elseif result == 0 then -- Error
 			return 0
 		else
@@ -204,12 +218,15 @@ function proto_htsp.dissector(tvbuf, pktinfo, root)
 		end
 	end
 
+	-- Add the number of HTSMSGs processed
+	tree:set_text(proto_htsp.description .. ", #HTSMSG: " .. htsmsg_num - 1)
+
 	-- Return what we've handled
 	return bytes_consumed
 end
 
 -- Handle dissection of one HTSP message
-dissect_htsp = function(tvbuf, pktinfo, root, offset)
+dissect_htsp = function(tvbuf, pktinfo, root, offset, htsmsg_num)
 	local length_val, length_tvbr = checkHtspLength(tvbuf, offset)
 
 	if length_val <= 0 then
@@ -217,25 +234,25 @@ dissect_htsp = function(tvbuf, pktinfo, root, offset)
 	end
 
 	-- set the protocol column to show our protocol name
-	pktinfo.cols.protocol:set("HTSP")
+	pktinfo.cols.protocol:set(proto_htsp.name)
 
 	-- set the INFO column too, but only if we haven't already set it before
 	-- for this frame/packet, because this function can be called multiple
 	-- times per packet/Tvb
-	if string.find(tostring(pktinfo.cols.info), "^HTSP") == nil then
-		pktinfo.cols.info:set("HTSP")
+	if string.find(tostring(pktinfo.cols.info), "^" .. proto_htsp.description) == nil then
+		pktinfo.cols.info:set(proto_htsp.description)
 	end
 
 	-- Add the protocol to the dissection tree
 	local htsp_buf = tvbuf:range(offset, length_val)
-	local tree = root:add(proto_htsp, htsp_buf, "HTSP Protocol")
+	local tree = root:add(proto_htsp, htsp_buf, "HTSMSG")
 	-- 0x42 comes from the data output in Wireshark
-	tree:append_text(
-		", Len: "
-			.. length_val
-			.. ", Offset: "
-			.. string.format("0x%x - 0x%x", offset + 0x42, offset + 0x42 + length_val)
-	)
+	tree:append_text(" # " .. htsmsg_num .. ", Len: " .. length_val)
+
+	-- NOTE: Doing it this way allows us to select the entire buffer
+	local offset_tree = tree:add(proto_htsp, htsp_buf)
+	offset_tree:set_text("Offset: " .. string.format("0x%x - 0x%x", offset + 0x42, offset + 0x42 + length_val))
+	offset_tree:set_generated(true)
 
 	-- Add the length of this HTSP message to the subtree
 	tree:add(proto_htsp_fields.msg_len, length_tvbr, length_val)
@@ -309,42 +326,25 @@ dissect_body = function(tree, tvbuf)
 		local str_datatype = msgtype_valstr[datatype_val]
 		local field_type = data_types[str_datatype]
 
-		-- local new_item = tree:add(
-		-- 	proto_htsp_fields.type,
-		-- 	tvbuf:range(offset, HTSMSG_HDR_LEN + name_length + data_length),
-		-- 	datatype_val
-		-- )
-
 		offset = offset + HTSMSG_HDR_LEN
 
+		-- Set name if available in the buffer
 		local name
-		-- Add name?
 		if name_length > 0 then
 			local name_tvbr = tvbuf:range(offset, name_length)
 			name = name_tvbr:string()
 		end
 
 		offset = offset + name_length
-		--[[
-    Add data, 
-     TODO: Handle default values if datalength is 0
-		 if data_length > 0 and field_type ~= nil then
-    ]]
+
 		if field_type ~= nil then
 			local subdissector = dissect_types[str_datatype]
 			local data_item
-			-- print(
-			-- 	tostring(get_tcp_stream())
-			-- 		.. ": subdissector: "
-			-- 		.. tostring(subdissector)
-			-- 		.. " msgtype_valstr[datatype_val]: "
-			-- 		.. tostring(msgtype_valstr[datatype_val])
-			-- )
+
 			-- Need to understand if we have any data or if we set default values
 			local data_buf = (data_length > 0) and tvbuf:range(offset, data_length) or nil
 			local sub_tree
 			if subdissector ~= nil then
-				-- Send the data buffer as nil if the data_length is 0, this avoids errors as we can check for nil
 				-- Some dissectors create a sub_tree that we can add to the tree
 				local data_value
 				data_value, sub_tree = subdissector(data_buf, tree)
@@ -360,7 +360,9 @@ dissect_body = function(tree, tvbuf)
 			else
 				data_item = tree:add(field_type, data_buf)
 			end
+
 			-- Split on the first colon, replace with the name of this item if applicable
+			-- TODO: Is this the best way doing this?
 			local string_val = data_item.text:match("[^:]+: (.*)") or ""
 
 			-- Add name?
@@ -371,15 +373,13 @@ dissect_body = function(tree, tvbuf)
 				data_item:set_text(string_val)
 			end
 
-			-- Some sub dissectors do not return any data
-			-- if data_item then
-			-- 	tree:append_text(", " .. data_item.text)
-			-- end
 			offset = offset + data_length
 		else
+			-- FIXME: Add to the expert info
+			-- This is for an unknown data type. Mark as error
 			print(
 				tostring(get_tcp_stream())
-					.. ": [DATALENGTH 0!] "
+					.. ": "
 					.. (msgtype_valstr[datatype_val] or "Unknown")
 					.. " data_length "
 					.. data_length
@@ -388,19 +388,12 @@ dissect_body = function(tree, tvbuf)
 			)
 		end
 
-		-- Format type text
-		-- if name then
-		-- Split on the first colon, replace with the name of this item if applicable
-		-- local string_val = item.text:match("[^:]+: (.*)")
-		-- 	data_string_val = data_string_val and (": " .. data_string_val) or ""
-		-- 	tree:set_text(name .. data_string_val .. " [" .. type_text .. "]")
-		-- end
-
 		-- We add the length of both name and data + the header length
 		bytes_consumed = offset
 	end
 end
 
+-- If you want to debug, make sure that the package path and package cpath are set correctly
 -- print("Package path: " .. package.path .. " Package cpath: " .. package.cpath)
 local tcp_port = DissectorTable.get("tcp.port")
 tcp_port:set(9982, proto_htsp)
