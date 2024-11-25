@@ -191,8 +191,12 @@ function proto_htsp.dissector(tvbuf, pktinfo, root)
 	local bytes_consumed = 0
 
 	-- Create one subtree that we use to put all the dissected HTSMSG fields under
-	local tree = root:add(proto_htsp, tvbuf, proto_htsp.description)
+	local tree = root:add(proto_htsp, tvbuf)
 
+	tree:set_text(proto_htsp.description)
+
+	-- Add the number of HTSMSGs processed
+	local tree_num_htmsgs = tree:add("#HTMSG"):set_generated(true)
 	-- Keep track of the message number
 	local htsmsg_num = 1
 
@@ -201,7 +205,11 @@ function proto_htsp.dissector(tvbuf, pktinfo, root)
 		local result = dissect_htsp(tvbuf, pktinfo, tree, bytes_consumed, htsmsg_num)
 		if result > 0 then -- Success
 			bytes_consumed = bytes_consumed + result
+			tree_num_htmsgs:set_text("Number of HTMSGs: " .. htsmsg_num)
 			htsmsg_num = htsmsg_num + 1
+
+			-- Makes the top item select the entire buffer
+			tree:set_len(bytes_consumed)
 		elseif result == 0 then -- Error
 			return 0
 		else
@@ -217,9 +225,6 @@ function proto_htsp.dissector(tvbuf, pktinfo, root)
 			return pktlen
 		end
 	end
-
-	-- Add the number of HTSMSGs processed
-	tree:set_text(proto_htsp.description .. ", #HTSMSG: " .. htsmsg_num - 1)
 
 	-- Return what we've handled
 	return bytes_consumed
@@ -245,23 +250,23 @@ dissect_htsp = function(tvbuf, pktinfo, root, offset, htsmsg_num)
 
 	-- Add the protocol to the dissection tree
 	local htsp_buf = tvbuf:range(offset, length_val)
-	local tree = root:add(proto_htsp, htsp_buf, "HTSMSG")
 	-- 0x42 comes from the data output in Wireshark
-	tree:append_text(" # " .. htsmsg_num .. ", Len: " .. length_val)
+	local tree = root:add(proto_htsp, htsp_buf, "HTSMSG"):append_text(" # " .. htsmsg_num .. ", Len: " .. length_val)
 
 	-- NOTE: Doing it this way allows us to select the entire buffer
-	local offset_tree = tree:add(proto_htsp, htsp_buf)
-	offset_tree:set_text("Offset: " .. string.format("0x%x - 0x%x", offset + 0x42, offset + 0x42 + length_val))
-	offset_tree:set_generated(true)
+	tree:add(proto_htsp, htsp_buf)
+		:set_text("Offset: " .. string.format("0x%x - 0x%x", offset + 0x42, offset + 0x42 + length_val))
+		:set_generated(true)
 
 	-- Add the length of this HTSP message to the subtree
 	tree:add(proto_htsp_fields.msg_len, length_tvbr, length_val)
 
-	-- Add the body
-	local body_tvbr = htsp_buf:range(HTSMSG_LEN)
-	local body = tree:add(proto_htsp_fields.body, body_tvbr)
-	body:set_text("Root body, Len: " .. body_tvbr:len())
-	dissect_body(body, body_tvbr)
+	-- Add the body if we have it
+	if length_val > HTSMSG_LEN then
+		local body_tvbr = htsp_buf:len() and htsp_buf:range(HTSMSG_LEN) or nil
+		local body = tree:add(proto_htsp_fields.body, body_tvbr):set_text("Root body, Len: " .. body_tvbr:len())
+		dissect_body(body, body_tvbr)
+	end
 	return length_val
 end
 
@@ -310,9 +315,6 @@ dissect_body = function(tree, tvbuf)
 		local data_length_buf = tvbuf(offset + 2, 4)
 		local data_length = data_length_buf:uint()
 
-		-- Add info to the body tree info
-		-- local new_item = tree:add(hdr_fields.type, datatype_buf, datatype_val)
-
 		-- Mark the type + name_length + data_length + name + data for this type (for Wireshark UI)
 		-- print(
 		-- 	tostring(get_tcp_stream())
@@ -323,6 +325,7 @@ dissect_body = function(tree, tvbuf)
 		-- 		.. " offset "
 		-- 		.. offset
 		-- )
+
 		local str_datatype = msgtype_valstr[datatype_val]
 		local field_type = data_types[str_datatype]
 
