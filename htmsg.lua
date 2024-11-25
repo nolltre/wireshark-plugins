@@ -88,7 +88,7 @@ local htsmsg_fields = {
 		"Length of name of field. If a field is part of a list message this must be 0"
 	),
 	datalength = ProtoField.uint32("htsmsg.datalength", "Datalength", base.DEC, nil, nil, "Length of field data"),
-	name = ProtoField.string("htsmsg.name", "name", "Field name, length as specified by Namelength"),
+	name = ProtoField.string("htsmsg.name", "name", base.UNICODE, "Field name, length as specified by Namelength"),
 	data = ProtoField.bytes("htsmsg.data", "data", base.SPACE, "Field payload"),
 }
 
@@ -136,7 +136,7 @@ dissect_str = function(str_buf)
 	if str_buf == nil then
 		return ""
 	else
-		return str_buf:string()
+		return str_buf:string(ENC_UTF_8)
 	end
 end
 
