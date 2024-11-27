@@ -1,7 +1,7 @@
 --[[ 
 Dissector for the HTSP protocol
 
-HTMSG Binary format
+HTSMSG Binary format
 https://docs.tvheadend.org/documentation/development/htsp/htsmsg-binary-format
 
 | Name | ID  | Description                     |
@@ -31,15 +31,46 @@ Data        N bytes         Field payload, for details see below
 -- Visible in Help -> About Wireshark -> Plugins tab
 local info = {
 	version = "0.0.2",
-	description = "Dissector for the HTSP protocol",
+	description = "Dissector for the Home Tv Streaming Protocol",
 	author = "Daniel Karmark",
 	repository = "https://github.com/nolltre/wireshark-plugins",
 }
 
 set_plugin_info(info)
 
-local proto_htsp = Proto("HTSP", "HTSP Protocol")
+local proto_htsp = Proto("HTSP", "Home Tv Streaming Protocol")
+
+-- Preferences
+-- Enum preference
+local DISPLAY_DEC = 1
+local DISPLAY_OCT = 2
+local DISPLAY_HEX = 3
+
+local BASE_FORMAT = {
+	[1] = "%d",
+	[2] = "o%o",
+	[3] = "0x%x",
+}
+
+local output_tab = {
+	{ 1, "Decimal", DISPLAY_DEC },
+	{ 2, "Octal", DISPLAY_OCT },
+	{ 3, "Hex", DISPLAY_HEX },
+}
+proto_htsp.prefs.base = Pref.enum(
+	"Output base", -- label
+	DISPLAY_DEC, -- default value
+	"Display the calculated date in this number base", -- description
+	output_tab, -- enum table
+	true -- show as radio buttons
+)
+--
+
 local get_tcp_stream = Field.new("frame.number")
+
+-- Frame len - TCP len = offset in frame for the HTSP message
+local get_frame_len = Field.new("frame.len")
+local get_tcp_len = Field.new("tcp.len")
 
 -- declare the functions used later (like C forward declarations)
 local dissect_htsp, checkHtspLength, dissect_body, dissect_s64, proto_htsp_fields
@@ -55,7 +86,7 @@ local htsp_field_types = {
 	UUID = 8,
 }
 
--- (from https://github.com/biggnou/pcap/blob/master/fpm.lua)
+-- (from https://github.com/wireshark/wireshark/blob/master/test/lua/dissectFPM.lua)
 -- a function to convert tables of enumerated types to value-string tables
 -- i.e., from { "name" = number } to { number = "name" }
 local function makeValString(enumTable)
@@ -85,6 +116,7 @@ local proto_htsp_fields = {
 -- HTSMSG field
 -- FIXME: Remove what we don't use
 local htsmsg_fields = {
+	htsmsg = ProtoField.bytes("htsp.htsmsg", "HTSMSG", base.SPACE, "HTSMSG"),
 	type = ProtoField.uint8("htsmsg.type", "Type", base.DEC, msgtype_valstr, nil, "Type of field"),
 	namelength = ProtoField.uint8(
 		"htsmsg.namelength",
@@ -122,7 +154,6 @@ end
 proto_htsp.fields = proto_htsp_fields
 
 dissect_s64 = function(s64_buf)
-	-- print(tostring(get_tcp_stream()) .. ": datatype_buf:len(): " .. ((s64_buf ~= nil) and s64_buf:len() or "nil"))
 	if s64_buf == nil then
 		return Int64(0)
 	end
@@ -133,19 +164,21 @@ dissect_s64 = function(s64_buf)
 	end
 
 	-- A S64 may be shorter than 8 bytes, create a new byte array with a 0 at the start to not get negative values
-	local new_int = ByteArray.new(string.rep("\0", 8 - s64_len), true)
-	new_int:append(s64_buf:bytes())
-	return new_int:int64()
+	local new_s64 = ByteArray.new(string.rep("\0", 8 - s64_len), true)
+	new_s64:append(s64_buf:bytes())
+	return new_s64:int64()
 end
 
+-- All strings are UTF-8 encoded
 dissect_str = function(str_buf)
-	if str_buf == nil then
-		return ""
-	else
+	if str_buf then
 		return str_buf:string(ENC_UTF_8)
+	else
+		return ":daksdsa"
 	end
 end
 
+-- A map or a list is handled like the root body, except that there's no total message length
 dissect_map_or_list = function(field_type, buf, tree)
 	local sub_tree
 	if buf then
@@ -180,8 +213,9 @@ local dissect_types = {
 	Bool = dissect_bool,
 	UUID = dissect_uuid,
 }
--- The HTSMG header size is 6 bytes
+-- The length of this message size is 4 bytes (32 bits)
 local HTSMSG_LEN = 4
+-- The HTSMG header size is 6 bytes
 local HTSMSG_HDR_LEN = 6
 
 function proto_htsp.dissector(tvbuf, pktinfo, root)
@@ -196,21 +230,26 @@ function proto_htsp.dissector(tvbuf, pktinfo, root)
 	tree:set_text(proto_htsp.description)
 
 	-- Add the number of HTSMSGs processed
-	local tree_num_htmsgs = tree:add("#HTMSG"):set_generated(true)
+	local tree_num_htmsgs = tree:add("#HTSMSG", tvbuf):set_generated(true)
 	-- Keep track of the message number
-	local htsmsg_num = 1
+	local htsmsg_num = 0
 
 	-- Do this in a while loop since multiple HTSP messages can appear in the same TCP segment
+	-- Note that the length is set before any return statement. This is because
+	-- the function may break out before all data is read from multiple segments
 	while bytes_consumed < pktlen do
-		local result = dissect_htsp(tvbuf, pktinfo, tree, bytes_consumed, htsmsg_num)
+		local result = dissect_htsp(tvbuf, pktinfo, tree, bytes_consumed, htsmsg_num + 1)
 		if result > 0 then -- Success
 			bytes_consumed = bytes_consumed + result
-			tree_num_htmsgs:set_text("Number of HTMSGs: " .. htsmsg_num)
-			htsmsg_num = htsmsg_num + 1
 
+			if result > HTSMSG_LEN then
+				htsmsg_num = htsmsg_num + 1
+			end
+			tree_num_htmsgs:set_text("Number of HTSMSGs: " .. htsmsg_num)
 			-- Makes the top item select the entire buffer
 			tree:set_len(bytes_consumed)
 		elseif result == 0 then -- Error
+			tree:append_text(", Len: " .. bytes_consumed)
 			return 0
 		else
 			-- Need more bytes
@@ -221,11 +260,13 @@ function proto_htsp.dissector(tvbuf, pktinfo, root)
 
 			pktinfo.desegment_len = result
 
+			tree:append_text(", Len: " .. bytes_consumed)
 			-- We still want to go ahead processing, return the entire package length
 			return pktlen
 		end
 	end
 
+	tree:append_text(", Len: " .. bytes_consumed)
 	-- Return what we've handled
 	return bytes_consumed
 end
@@ -248,23 +289,31 @@ dissect_htsp = function(tvbuf, pktinfo, root, offset, htsmsg_num)
 		pktinfo.cols.info:set(proto_htsp.description)
 	end
 
-	-- Add the protocol to the dissection tree
-	local htsp_buf = tvbuf:range(offset, length_val)
-	-- 0x42 comes from the data output in Wireshark
-	local tree = root:add(proto_htsp, htsp_buf, "HTSMSG"):append_text(" # " .. htsmsg_num .. ", Len: " .. length_val)
+	-- The user's preferred output format for numbers
+	local number_base_format = BASE_FORMAT[proto_htsp.prefs.base]
 
-	-- NOTE: Doing it this way allows us to select the entire buffer
-	tree:add(proto_htsp, htsp_buf)
-		:set_text("Offset: " .. string.format("0x%x - 0x%x", offset + 0x42, offset + 0x42 + length_val))
-		:set_generated(true)
-
-	-- Add the length of this HTSP message to the subtree
-	tree:add(proto_htsp_fields.msg_len, length_tvbr, length_val)
-
-	-- Add the body if we have it
+	-- Add the protocol to the dissection tree, as a tab, only if the length is greater than the # of length bytes
 	if length_val > HTSMSG_LEN then
+		local htsp_total_buf = tvbuf:range(offset, length_val)
+		local htsp_buf = ByteArray.tvb(htsp_total_buf:bytes(), "HTSMSG #" .. htsmsg_num)
+
+		local tree = root:add(proto_htsp_fields.htsmsg, htsp_total_buf)
+			:set_text("HTSMSG #" .. htsmsg_num .. ", Len: " .. string.format(number_base_format, length_val))
+
+		-- Calculate the offset for this message in the frame. Get the entire frame length and subtract the TCP length.
+		-- What we are left with is the payload offset in the TCP packet
+		local frame_len = get_frame_len().value
+		local tcp_len = get_tcp_len().value
+		local tcp_payload_offset = frame_len - tcp_len
+		tcp_payload_offset = offset + tcp_payload_offset
+
+		-- Add the length of this HTSP message to the subtree
+		tree:add(proto_htsp_fields.msg_len, htsp_buf:range(0, length_tvbr:len()), length_val)
+
+		-- Add the body if we have it
 		local body_tvbr = htsp_buf:len() and htsp_buf:range(HTSMSG_LEN) or nil
-		local body = tree:add(proto_htsp_fields.body, body_tvbr):set_text("Root body, Len: " .. body_tvbr:len())
+		local body = tree:add(proto_htsp_fields.body, body_tvbr)
+			:set_text("Root body, Len: " .. string.format(number_base_format, body_tvbr:len()))
 		dissect_body(body, body_tvbr)
 	end
 	return length_val
